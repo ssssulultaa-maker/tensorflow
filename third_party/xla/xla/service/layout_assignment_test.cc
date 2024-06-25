@@ -525,7 +525,7 @@ class OperandsMustBeTheSameLayoutAssignment : public LayoutAssignment {
   absl::Status PropagateBufferConstraint(
       const BufferLayoutConstraint& buffer_constraint,
       LayoutConstraints* constraints) override {
-    const LogicalBuffer& buffer = buffer_constraint.buffer();
+    const HloValue& buffer = buffer_constraint.buffer();
     const HloInstruction* instruction = buffer.instruction();
 
     // Force the operands' layout to the output layout.

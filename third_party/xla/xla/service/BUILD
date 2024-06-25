@@ -1636,6 +1636,7 @@ cc_library(
         "//xla/backends/gpu/tests:__pkg__",
         "//xla/backends/gpu/transforms:__subpackages__",
         "//third_party/pathways/configuration:__subpackages__",
+        "//learning/brain/google/xla:__pkg__",
     ]),
     deps = [
         ":buffer_value",
@@ -3531,7 +3532,7 @@ cc_library(
     deps = [
         ":computation_layout",
         ":hlo_graph_dumper",
-        ":logical_buffer",
+        ":hlo_value",
         ":while_util",
         "//xla:permutation_util",
         "//xla:shape_layout",
@@ -3539,7 +3540,7 @@ cc_library(
         "//xla:status_macros",
         "//xla:util",
         "//xla:xla_data_proto_cc",
-        "//xla/hlo/analysis:tuple_points_to_analysis",
+        "//xla/hlo/analysis:hlo_dataflow_analysis",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass",
         "//xla/hlo/transforms/simplifiers:hlo_dce",
