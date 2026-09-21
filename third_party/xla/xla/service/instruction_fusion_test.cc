@@ -15,10 +15,18 @@ limitations under the License.
 
 #include "xla/service/instruction_fusion.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/algorithm/container.h"
+#include "absl/log/check.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/ir/hlo_computation.h"
@@ -28,6 +36,7 @@ limitations under the License.
 #include "xla/hlo/parser/hlo_parser.h"
 #include "xla/hlo/testlib/hlo_hardware_independent_test_base.h"
 #include "xla/hlo/utils/hlo_matchers.h"
+#include "xla/service/fusion_queue.h"
 #include "xla/shape_util.h"
 #include "xla/xla_data.pb.h"
 
@@ -1113,6 +1122,233 @@ TEST_F(InstructionFusionTest, DontFuseProducerIfInplaceConflict) {
   FusionDecision fusion_decision = InstructionFusion::ShouldFuseInPlaceOp(
       add, root, &alias_info_, std::nullopt);
   EXPECT_TRUE(fusion_decision.IsForbidden());
+}
+
+// Dequeues the given consumers in the given order, each with all of its
+// operands, so a test controls which fusions happen before which multi output
+// fusion check.
+class OrderedFusionQueue : public FusionQueue {
+ public:
+  explicit OrderedFusionQueue(std::vector<HloInstruction*> order)
+      : order_(std::move(order)) {}
+
+  std::pair<HloInstruction*, std::vector<int64_t>>
+  DequeueNextInstructionAndOperandsToFuseInOrder() override {
+    if (next_ == order_.size()) {
+      return {nullptr, {}};
+    }
+    HloInstruction* instruction = order_[next_++];
+    std::vector<int64_t> operands(instruction->operand_count());
+    absl::c_iota(operands, 0);
+    return {instruction, operands};
+  }
+  void RemoveInstruction(HloInstruction* instruction) override {}
+  const std::vector<bool>* FusionConfiguration() override { return nullptr; }
+
+ private:
+  std::vector<HloInstruction*> order_;
+  size_t next_ = 0;
+};
+
+// Fuses only the (consumer, producer) name pairs in `fusible`, offers multi
+// output fusion for every producer with several users, and processes the
+// consumers named in `order`. `after_fuse`, if given, runs on every regular
+// fusion right after it is formed.
+class MultiOutputCycleFusion : public InstructionFusion {
+ public:
+  MultiOutputCycleFusion(
+      const AliasInfo* alias_info, std::vector<absl::string_view> order,
+      std::vector<std::pair<absl::string_view, absl::string_view>> fusible,
+      std::function<void(HloInstruction*)> after_fuse = nullptr)
+      : InstructionFusion(InstructionFusion::IsExpensive, alias_info),
+        order_(std::move(order)),
+        fusible_(std::move(fusible)),
+        after_fuse_(std::move(after_fuse)) {}
+
+ protected:
+  HloInstruction* Fuse(HloInstruction* producer, HloInstruction* consumer,
+                       HloComputation* computation) override {
+    HloInstruction* fusion =
+        InstructionFusion::Fuse(producer, consumer, computation);
+    if (after_fuse_ != nullptr) {
+      after_fuse_(fusion);
+    }
+    return fusion;
+  }
+
+  std::unique_ptr<FusionQueue> GetFusionQueue(
+      HloComputation* computation) override {
+    std::vector<HloInstruction*> order;
+    for (absl::string_view name : order_) {
+      HloInstruction* instruction = computation->GetInstructionWithName(name);
+      CHECK(instruction != nullptr) << name;
+      order.push_back(instruction);
+    }
+    return std::make_unique<OrderedFusionQueue>(std::move(order));
+  }
+
+  FusionDecision ShouldFuse(HloInstruction* consumer,
+                            int64_t operand_index) override {
+    for (const auto& [consumer_name, producer_name] : fusible_) {
+      if (consumer->name() == consumer_name &&
+          consumer->operand(operand_index)->name() == producer_name) {
+        return FusionDecision::Allow();
+      }
+    }
+    return FusionDecision::Forbid("not in the fusible list");
+  }
+
+  FusionDecision IsConsumerSuitableForMultiOutputFusion(
+      const HloInstruction* consumer) const override {
+    return FusionDecision::Allow();
+  }
+
+  FusionDecision ShouldFuseOperandIntoMultiOutputFusion(
+      HloInstruction* consumer, int64_t operand_index) override {
+    return FusionDecision(consumer->operand(operand_index)->user_count() > 1,
+                          "producer has one user");
+  }
+
+ private:
+  std::vector<absl::string_view> order_;
+  std::vector<std::pair<absl::string_view, absl::string_view>> fusible_;
+  std::function<void(HloInstruction*)> after_fuse_;
+};
+
+// The multi output fusion cycle check searches forward from the producer and
+// skips instructions ordered at or after the consumer. Fusions created earlier
+// in the loop must be ordered where their consumer was: here the path from the
+// producer (itself a fusion, so the stale reachability map cannot answer) to
+// the consumer's other operand runs through a fusion created two steps
+// earlier, and the check must still find it: an ordinal past the consumer
+// would prune that fusion and hide the cycle. The first multi output fusion
+// only establishes the order before those fusions happen.
+TEST_F(InstructionFusionTest, MultiOutputCycleCheckSearchesThroughNewFusion) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+  HloModule test_module
+  ENTRY entry_computation {
+    p = f32[4] parameter(0)
+    m0 = f32[4] negate(p)
+    m1 = f32[4] abs(p)
+    m2 = f32[4] tanh(m0)
+    m = f32[4] add(m0, m1)
+    a0 = f32[4] exponential(p)
+    a = f32[4] negate(a0)
+    b = f32[4] abs(a)
+    c = f32[4] cosine(b)
+    e = f32[4] tanh(c)
+    d = f32[4] add(e, a)
+    ROOT r = (f32[4], f32[4], f32[4]) tuple(d, m, m2)
+  })")
+                    .value();
+  MultiOutputCycleFusion fusion(&alias_info_, /*order=*/{"m", "a", "c", "d"},
+                                /*fusible=*/{{"a", "a0"}, {"c", "b"}});
+  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&fusion, module.get()));
+  EXPECT_TRUE(changed);
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  EXPECT_THAT(root->operand(1), op::GetTupleElement(op::Fusion()));
+  // Fusing a into d as a multi output fusion would make e, which reads a's
+  // fusion through c's fusion, both an operand and a user of the result.
+  EXPECT_THAT(root->operand(0),
+              op::Add(op::Tanh(op::Fusion(op::Fusion())), op::Fusion()));
+}
+
+// A multi output fusion moves the producer's other users after the fusion, so
+// the order in place before it must not bound a later check: after a is fused
+// into b, x (and so y) read a through the fusion, and fusing q into y would
+// close a cycle through it. The post order lists x and y before b (the root's
+// first operand first), so the fusion has to move them.
+TEST_F(InstructionFusionTest, MultiOutputCycleCheckSeesMultiOutputFusion) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+  HloModule test_module
+  ENTRY entry_computation {
+    p = f32[4] parameter(0)
+    q = f32[4] exponential(p)
+    a = f32[4] negate(p)
+    x = f32[4] abs(a)
+    y = f32[4] add(x, q)
+    b = f32[4] multiply(a, q)
+    ROOT root = f32[4] subtract(y, b)
+  })")
+                    .value();
+  MultiOutputCycleFusion fusion(&alias_info_, /*order=*/{"b", "y"},
+                                /*fusible=*/{});
+  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&fusion, module.get()));
+  EXPECT_TRUE(changed);
+  EXPECT_THAT(module->entry_computation()->root_instruction(),
+              op::Subtract(op::Add(op::Abs(op::GetTupleElement(op::Fusion())),
+                                   op::Exp()),
+                           op::GetTupleElement(op::Fusion())));
+}
+
+// A fusion whose outcome is not the expected shape must invalidate the order.
+// Here the test's Fuse also makes y read the new fusion, which the fusion's
+// consumer never reached; without a recompute the next check would skip the
+// fusion, ordered where b was, on its way to y.
+TEST_F(InstructionFusionTest, MultiOutputCycleCheckAfterUnverifiedFusion) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+  HloModule test_module
+  ENTRY entry_computation {
+    p = f32[4] parameter(0)
+    m0 = f32[4] negate(p)
+    m1 = f32[4] abs(p)
+    m2 = f32[4] tanh(m0)
+    m = f32[4] add(m0, m1)
+    w = f32[4] abs(p)
+    y = f32[4] tanh(w)
+    q = f32[4] exponential(p)
+    z = f32[4] add(y, q)
+    a = f32[4] negate(q)
+    b = f32[4] cosine(a)
+    ROOT r = (f32[4], f32[4], f32[4], f32[4]) tuple(m, m2, z, b)
+  })")
+                    .value();
+  HloComputation* computation = module->entry_computation();
+  MultiOutputCycleFusion fusion(
+      &alias_info_, /*order=*/{"m", "b", "z"}, /*fusible=*/{{"b", "a"}},
+      /*after_fuse=*/[&](HloInstruction* new_fusion) {
+        ASSERT_OK(computation->GetInstructionWithName("y")->ReplaceOperandWith(
+            0, new_fusion));
+      });
+  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&fusion, module.get()));
+  EXPECT_TRUE(changed);
+  // Fusing q into z as a multi output fusion would close the cycle through
+  // the new fusion and y.
+  EXPECT_THAT(FindInstruction(module.get(), "z"),
+              op::Add(op::Tanh(op::Fusion()), op::Exp()));
+}
+
+// A multi output fusion into an instruction that an earlier multi output
+// fusion moved: the instructions its search expanded must again end up after
+// it, in the smaller space such an instruction owns. The post order lists x1
+// before n1, n2 and z (the root's first operand first), so the second fusion
+// has to move them.
+TEST_F(InstructionFusionTest, MultiOutputCycleCheckAfterNestedMove) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+  HloModule test_module
+  ENTRY entry_computation {
+    p = f32[4] parameter(0)
+    p1 = f32[4] abs(p)
+    w = f32[4] floor(p)
+    u = f32[4] exponential(p)
+    x1 = f32[4] clamp(p1, u, w)
+    n1 = f32[4] negate(u)
+    n2 = f32[4] tanh(n1)
+    z = f32[4] add(n2, w)
+    c = f32[4] multiply(p1, p)
+    ROOT r = (f32[4], f32[4], f32[4]) tuple(x1, z, c)
+  })")
+                    .value();
+  MultiOutputCycleFusion fusion(&alias_info_, /*order=*/{"c", "x1", "z"},
+                                /*fusible=*/{});
+  ASSERT_OK_AND_ASSIGN(bool changed, RunHloPass(&fusion, module.get()));
+  EXPECT_TRUE(changed);
+  // p1 fused into c moved x1 after c; u fused into x1 moved n1, n2 and z
+  // after x1's fusion. Fusing w into z would close the cycle through that
+  // fusion, n1 and n2.
+  EXPECT_THAT(FindInstruction(module.get(), "z"),
+              op::Add(op::Tanh(op::Negate(op::GetTupleElement(op::Fusion()))),
+                      op::Floor()));
 }
 
 class FusionDecisionTest : public HloHardwareIndependentTestBase {};

@@ -519,9 +519,377 @@ class ReversePostOrderFusionQueue : public FusionQueue {
   std::vector<bool> fusion_config_;
 };
 
+// A topological order of the instructions of one computation that bounds the
+// search in MultiOutputFusionCreatesCycle. Validity invariant: whenever an
+// ordered instruction u reaches an ordered instruction v, through any number
+// of unordered instructions, ord(u) < ord(v). The operands and control
+// predecessors of the consumer, and everything that reaches them, therefore
+// precede the consumer, and the search from the producer need not expand an
+// instruction at or past the consumer's ordinal. An instruction without an
+// ordinal is never pruned, so a missing entry costs time, not correctness. A
+// wrong entry would cost correctness, so the order is only ever established
+// or changed by the three events below; every other change the fusion loop
+// makes invalidates it, to be recomputed at the next query.
+//
+// 1. Recompute: the ordinals come from MakeInstructionPostOrder, which visits
+//    operands and control predecessors first, spaced kSpacing apart so that
+//    later instructions fit between them. This establishes the invariant.
+// 2. Accepted replacement, after Fuse or FuseIntoMultiOutput, verified after
+//    the fact: the consumer C is replaced by, or becomes, the fusion F, whose
+//    users are C's (plus its outputs, below), whose operands come from C and
+//    the producer P and whose control dependencies are C's, while P keeps its
+//    operands and control dependencies. F takes C's ordinal: everything it
+//    reads was ordered before C and everything that reads it after C.
+// 3. Move, after FuseIntoMultiOutput: F's new users are its outputs
+//    (get-tuple-elements read by C's and P's old users), so P's other users
+//    now depend on F. The cycle search that allowed the fusion expanded
+//    exactly the ordered instructions below C reachable from P's other users
+//    and control successors, none of which reaches an operand or control
+//    predecessor of C. They move into the space after F in their old relative
+//    order, above F's outputs: their predecessors were ordered before C or
+//    move with them, and their successors move with them or were ordered after
+//    C already. Later batches go below earlier ones, since a moved instruction
+//    may reach members of an earlier batch and never the reverse.
+//
+// Removing a dead producer needs no update: only edges disappear, and the
+// control dependencies relinked around it join instructions already ordered
+// around it.
+class TopologicalOrdinals {
+ public:
+  static constexpr int64_t kNone = -1;
+
+  // What a fusion may change, captured before it runs.
+  struct FusionSnapshot {
+    const HloInstruction* producer = nullptr;
+    const HloInstruction* consumer = nullptr;
+    int64_t consumer_ordinal = kNone;
+    int64_t instruction_count = 0;
+    absl::flat_hash_set<const HloInstruction*> consumer_operands;
+    absl::flat_hash_set<const HloInstruction*> consumer_users;
+    absl::flat_hash_set<const HloInstruction*> consumer_control_predecessors;
+    absl::flat_hash_set<const HloInstruction*> consumer_control_successors;
+    std::vector<const HloInstruction*> producer_operands;
+    absl::flat_hash_set<const HloInstruction*> producer_operand_set;
+    absl::flat_hash_set<const HloInstruction*> producer_users;
+    absl::flat_hash_set<const HloInstruction*> producer_control_predecessors;
+    absl::flat_hash_set<const HloInstruction*> producer_control_successors;
+  };
+
+  explicit TopologicalOrdinals(const HloComputation* computation)
+      : computation_(computation) {}
+
+  // Recomputes the order if a change may have invalidated it.
+  void EnsureValid() {
+    if (!dirty_) {
+      return;
+    }
+    VLOG(2) << "Computing the instruction order of " << computation_->name()
+            << " for the multi output fusion cycle check";
+    slots_.clear();
+    spaces_.clear();
+    int64_t ordinal = 0;
+    for (const HloInstruction* instruction :
+         computation_->MakeInstructionPostOrder()) {
+      SetOrdinal(instruction, ordinal);
+      ordinal += kSpacing;
+    }
+    dirty_ = false;
+  }
+
+  void Invalidate() { dirty_ = true; }
+
+  // The ordinal of `instruction`, or kNone when it was added after the last
+  // recompute and no verified fusion gave it one.
+  int64_t Ordinal(const HloInstruction* instruction) const {
+    const int32_t id = instruction->local_id();
+    if (id < 0 || static_cast<size_t>(id) >= slots_.size() ||
+        slots_[id].instruction != instruction) {
+      return kNone;
+    }
+    return slots_[id].ordinal;
+  }
+
+  // The cycle search for fusing `producer` into `consumer` reports the
+  // instructions it expands, in case the multi output fusion happens.
+  void BeginSearch(const HloInstruction* producer,
+                   const HloInstruction* consumer) {
+    searched_producer_ = producer;
+    searched_consumer_ = consumer;
+    expanded_.clear();
+  }
+  void RecordExpanded(const HloInstruction* instruction) {
+    expanded_.push_back(instruction);
+  }
+
+  FusionSnapshot BeforeFusion(const HloInstruction* producer,
+                              const HloInstruction* consumer) const {
+    FusionSnapshot snapshot;
+    if (dirty_) {
+      return snapshot;
+    }
+    snapshot.producer = producer;
+    snapshot.consumer = consumer;
+    snapshot.consumer_ordinal = Ordinal(consumer);
+    snapshot.instruction_count = computation_->instruction_count();
+    Insert(consumer->operands(), snapshot.consumer_operands);
+    Insert(consumer->users(), snapshot.consumer_users);
+    Insert(consumer->control_predecessors(),
+           snapshot.consumer_control_predecessors);
+    Insert(consumer->control_successors(),
+           snapshot.consumer_control_successors);
+    snapshot.producer_operands.assign(producer->operands().begin(),
+                                      producer->operands().end());
+    Insert(producer->operands(), snapshot.producer_operand_set);
+    Insert(producer->users(), snapshot.producer_users);
+    Insert(producer->control_predecessors(),
+           snapshot.producer_control_predecessors);
+    Insert(producer->control_successors(),
+           snapshot.producer_control_successors);
+    return snapshot;
+  }
+
+  // Keeps the order if `fusion` is the verified Fuse shape, else invalidates.
+  void AfterFusion(const FusionSnapshot& before, const HloInstruction* fusion) {
+    if (dirty_) {
+      return;
+    }
+    if (!VerifyReplacement(before, fusion) ||
+        !SameSet(fusion->users(), before.consumer_users) ||
+        !ProducerUsersKept(before, /*outputs=*/{}) ||
+        computation_->instruction_count() != before.instruction_count) {
+      Invalidate();
+      return;
+    }
+    if (fusion != before.consumer && before.consumer_ordinal != kNone) {
+      SetOrdinal(fusion, before.consumer_ordinal);
+    }
+  }
+
+  // Keeps the order if `fusion` is the verified FuseIntoMultiOutput shape and
+  // the expanded instructions of its cycle search fit after it, else
+  // invalidates.
+  void AfterMultiOutputFusion(const FusionSnapshot& before,
+                              const HloInstruction* fusion) {
+    if (dirty_) {
+      return;
+    }
+    if (before.producer != searched_producer_ ||
+        before.consumer != searched_consumer_ ||
+        before.consumer_ordinal == kNone ||
+        !VerifyReplacement(before, fusion)) {
+      Invalidate();
+      return;
+    }
+    // New users of the fusion are its outputs, read by old users of the
+    // consumer or of the producer.
+    std::vector<const HloInstruction*> outputs;
+    for (const HloInstruction* user : fusion->users()) {
+      if (before.consumer_users.contains(user)) {
+        continue;
+      }
+      if (Ordinal(user) != kNone ||
+          !absl::c_all_of(user->users(), [&](const HloInstruction* reader) {
+            return reader != before.consumer &&
+                   (before.consumer_users.contains(reader) ||
+                    before.producer_users.contains(reader));
+          })) {
+        Invalidate();
+        return;
+      }
+      outputs.push_back(user);
+    }
+    // Old users of the consumer read the fusion or one of its outputs.
+    if (computation_->instruction_count() !=
+            before.instruction_count + outputs.size() ||
+        !ProducerUsersKept(before, outputs) ||
+        !absl::c_all_of(before.consumer_users, [&](const HloInstruction* user) {
+          return user->IsUserOf(fusion) || ReadsOneOf(user, outputs);
+        })) {
+      Invalidate();
+      return;
+    }
+    const int64_t owner = before.consumer_ordinal;
+    if (fusion != before.consumer) {
+      SetOrdinal(fusion, owner);
+    }
+    Space& space = SpaceAfter(owner);
+    for (const HloInstruction* output : outputs) {
+      if (space.next_output >= space.output_limit) {
+        Invalidate();
+        return;
+      }
+      SetOrdinal(output, space.next_output++);
+    }
+    // The expanded instructions keep their relative order; instructions
+    // without an ordinal stay without one.
+    std::vector<std::pair<int64_t, const HloInstruction*>> moved;
+    for (const HloInstruction* instruction : expanded_) {
+      const int64_t ordinal = Ordinal(instruction);
+      if (ordinal != kNone) {
+        moved.emplace_back(ordinal, instruction);
+      }
+    }
+    absl::c_sort(moved);
+    if (space.next_batch -
+            (static_cast<int64_t>(moved.size()) - 1) * space.batch_stride <
+        space.batch_floor) {
+      Invalidate();
+      return;
+    }
+    for (auto it = moved.rbegin(); it != moved.rend(); ++it) {
+      SetOrdinal(it->second, space.next_batch);
+      space.next_batch -= space.batch_stride;
+    }
+  }
+
+ private:
+  // A recomputed ordinal o owns the ordinals up to o + kSpacing: the outputs
+  // of multi output fusions into o go to o + 1 .. o + kOutputSlots - 1 and the
+  // instructions those fusions move to o + kSpacing - k * kBatchStride. A
+  // moved instruction m owns the ordinals up to m + kBatchStride in the same
+  // way: outputs at m + 1 .. m + kNestedOutputSlots - 1, moved instructions
+  // from m + kBatchStride - 1 downward.
+  static constexpr int64_t kSpacing = int64_t{1} << 32;
+  static constexpr int64_t kOutputSlots = int64_t{1} << 16;
+  static constexpr int64_t kBatchStride = int64_t{1} << 10;
+  static constexpr int64_t kNestedOutputSlots = 64;
+
+  struct Slot {
+    const HloInstruction* instruction = nullptr;
+    int64_t ordinal = kNone;
+  };
+
+  // The free ordinals right after an instruction: outputs are placed upward
+  // from the instruction, moved instructions downward from the far end.
+  struct Space {
+    int64_t next_output = 0;
+    int64_t output_limit = 0;
+    int64_t next_batch = 0;
+    int64_t batch_stride = 0;
+    int64_t batch_floor = 0;
+  };
+
+  template <typename Range>
+  static void Insert(const Range& range,
+                     absl::flat_hash_set<const HloInstruction*>& out) {
+    out.insert(range.begin(), range.end());
+  }
+
+  template <typename Range>
+  static bool SameSet(const Range& range,
+                      const absl::flat_hash_set<const HloInstruction*>& set) {
+    return range.size() == set.size() &&
+           absl::c_all_of(range, [&](const HloInstruction* instruction) {
+             return set.contains(instruction);
+           });
+  }
+
+  // Whether the fusion replaced the consumer, or is the consumer, with
+  // operands and control dependencies that were ordered around the consumer,
+  // and the producer unchanged apart from its users.
+  bool VerifyReplacement(const FusionSnapshot& before,
+                         const HloInstruction* fusion) const {
+    const HloInstruction* consumer = before.consumer;
+    const HloInstruction* producer = before.producer;
+    if (fusion != consumer &&
+        (consumer->parent() != nullptr || Ordinal(fusion) != kNone)) {
+      return false;
+    }
+    auto from_before = [&](const HloInstruction* operand) {
+      return operand == producer ||
+             before.consumer_operands.contains(operand) ||
+             before.producer_operand_set.contains(operand);
+    };
+    return absl::c_all_of(fusion->operands(), from_before) &&
+           SameSet(fusion->control_predecessors(),
+                   before.consumer_control_predecessors) &&
+           SameSet(fusion->control_successors(),
+                   before.consumer_control_successors) &&
+           absl::c_equal(producer->operands(), before.producer_operands) &&
+           SameSet(producer->control_predecessors(),
+                   before.producer_control_predecessors) &&
+           SameSet(producer->control_successors(),
+                   before.producer_control_successors);
+  }
+
+  static bool ReadsOneOf(const HloInstruction* reader,
+                         absl::Span<const HloInstruction* const> outputs) {
+    return absl::c_any_of(outputs, [&](const HloInstruction* output) {
+      return reader->IsUserOf(output);
+    });
+  }
+
+  // Whether every old user of the producer other than the consumer still
+  // reads the producer, reads one of the fusion's outputs, or was an old user
+  // of the consumer and so already ordered after it.
+  static bool ProducerUsersKept(
+      const FusionSnapshot& before,
+      absl::Span<const HloInstruction* const> outputs) {
+    return absl::c_all_of(
+        before.producer_users, [&](const HloInstruction* user) {
+          return user == before.consumer ||
+                 before.consumer_users.contains(user) ||
+                 user->IsUserOf(before.producer) || ReadsOneOf(user, outputs);
+        });
+  }
+
+  Space& SpaceAfter(int64_t owner) {
+    auto it = spaces_.find(owner);
+    if (it != spaces_.end()) {
+      return it->second;
+    }
+    Space space;
+    space.next_output = owner + 1;
+    const int64_t offset = owner % kSpacing;
+    if (offset == 0) {
+      // A recomputed ordinal owns the spacing after it.
+      space.output_limit = owner + kOutputSlots;
+      space.batch_stride = kBatchStride;
+      space.next_batch = owner + kSpacing - kBatchStride;
+      space.batch_floor = space.output_limit;
+    } else if (offset >= kOutputSlots && offset % kBatchStride == 0) {
+      // An instruction moved into a spacing owns the stride after it.
+      space.output_limit = owner + kNestedOutputSlots;
+      space.batch_stride = 1;
+      space.next_batch = owner + kBatchStride - 1;
+      space.batch_floor = space.output_limit;
+    } else {
+      // An output or an instruction of a nested batch: no room.
+      space.output_limit = space.next_output;
+      space.batch_stride = 1;
+      space.next_batch = owner;
+      space.batch_floor = owner + 1;
+    }
+    return spaces_.emplace(owner, space).first->second;
+  }
+
+  void SetOrdinal(const HloInstruction* instruction, int64_t ordinal) {
+    const int32_t id = instruction->local_id();
+    CHECK_GE(id, 0);
+    if (static_cast<size_t>(id) >= slots_.size()) {
+      slots_.resize(id + 1);
+    }
+    slots_[id] = {instruction, ordinal};
+  }
+
+  const HloComputation* computation_;
+  // Indexed by HloInstruction::local_id. Only HloComputation::Cleanup
+  // renumbers local ids and the loop never calls it, but each slot remembers
+  // its instruction so a renumbered id reads as unordered rather than as
+  // another instruction's ordinal.
+  std::vector<Slot> slots_;
+  absl::flat_hash_map<int64_t, Space> spaces_;
+  const HloInstruction* searched_producer_ = nullptr;
+  const HloInstruction* searched_consumer_ = nullptr;
+  std::vector<const HloInstruction*> expanded_;
+  bool dirty_ = true;
+};
+
 bool MultiOutputFusionCreatesCycle(HloInstruction* producer,
                                    HloInstruction* consumer,
-                                   const HloReachabilityMap& reachability) {
+                                   const HloReachabilityMap& reachability,
+                                   TopologicalOrdinals& ordinals) {
+  ordinals.BeginSearch(producer, consumer);
   absl::flat_hash_set<int64_t> operands;
   auto insert = [&](const HloInstruction* operand) {
     if (operand == producer) {
@@ -553,26 +921,45 @@ bool MultiOutputFusionCreatesCycle(HloInstruction* producer,
   }
 
   // Do a DFS on the producer to see if any of the other consumer operands are
-  // reachable in the current state of the graph.
-  std::vector<HloInstruction*> worklist = producer->users();
-  worklist.insert(worklist.end(), producer->control_successors().begin(),
-                  producer->control_successors().end());
-  absl::flat_hash_set<int64_t> visits;
-  while (!worklist.empty()) {
-    const HloInstruction* user = worklist.back();
-    worklist.pop_back();
-    if (operands.count(user->unique_id()) != 0) {
-      return true;
+  // reachable in the current state of the graph. An instruction ordered at or
+  // after the consumer cannot reach them (they and everything that reaches them
+  // precede the consumer), so the bounded search does not expand it.
+  ordinals.EnsureValid();
+  const int64_t bound = ordinals.Ordinal(consumer);
+  auto search = [&](bool bounded) {
+    std::vector<HloInstruction*> worklist = producer->users();
+    worklist.insert(worklist.end(), producer->control_successors().begin(),
+                    producer->control_successors().end());
+    absl::flat_hash_set<int64_t> visits;
+    while (!worklist.empty()) {
+      const HloInstruction* user = worklist.back();
+      worklist.pop_back();
+      if (operands.count(user->unique_id()) != 0) {
+        return true;
+      }
+      if (bounded && bound != TopologicalOrdinals::kNone) {
+        const int64_t ordinal = ordinals.Ordinal(user);
+        if (ordinal != TopologicalOrdinals::kNone && ordinal >= bound) {
+          continue;
+        }
+      }
+      if (visits.count(user->unique_id()) == 0) {
+        visits.insert(user->unique_id());
+        if (bounded) {
+          ordinals.RecordExpanded(user);
+        }
+        worklist.insert(worklist.end(), user->users().begin(),
+                        user->users().end());
+        worklist.insert(worklist.end(), user->control_successors().begin(),
+                        user->control_successors().end());
+      }
     }
-    if (visits.count(user->unique_id()) == 0) {
-      visits.insert(user->unique_id());
-      worklist.insert(worklist.end(), user->users().begin(),
-                      user->users().end());
-      worklist.insert(worklist.end(), user->control_successors().begin(),
-                      user->control_successors().end());
-    }
-  }
-  return false;
+    return false;
+  };
+  const bool creates_cycle = search(/*bounded=*/true);
+  // The bound may only skip instructions that cannot reach a target.
+  DCHECK_EQ(creates_cycle, search(/*bounded=*/false));
+  return creates_cycle;
 }
 
 }  // namespace
@@ -621,6 +1008,7 @@ absl::StatusOr<bool> InstructionFusion::RunImpl(
           computation->MakeInstructionPostOrder(), *reachability);
     }
     auto fusion_queue = GetFusionQueue(computation);
+    TopologicalOrdinals ordinals(computation);
 
     // Instruction fusion effectively fuses edges in the computation graph
     // (producer instruction -> consumer instruction) so we iterate over all
@@ -683,7 +1071,10 @@ absl::StatusOr<bool> InstructionFusion::RunImpl(
           }
 
           fusion_queue->PreFusion(operand, instruction);
+          TopologicalOrdinals::FusionSnapshot before =
+              ordinals.BeforeFusion(operand, instruction);
           fusion_instruction = Fuse(operand, instruction, computation);
+          ordinals.AfterFusion(before, fusion_instruction);
         } else {
           VLOG(3) << "not fusing operand " << operand->ToString() << " because "
                   << use_regular_fusion.Explain();
@@ -698,10 +1089,10 @@ absl::StatusOr<bool> InstructionFusion::RunImpl(
               ShouldFuseOperandIntoMultiOutputFusion(instruction, i));
 
           if (use_mof) {
-            use_mof = use_mof.And(
-                FusionDecision{!MultiOutputFusionCreatesCycle(
-                                   operand, instruction, *reachability),
-                               "multi-output fusion creates a cycle"});
+            use_mof = use_mof.And(FusionDecision{
+                !MultiOutputFusionCreatesCycle(operand, instruction,
+                                               *reachability, ordinals),
+                "multi-output fusion creates a cycle"});
           }
           if (use_mof && consume_fuel()) {
             if (dump_fusion) {
@@ -710,8 +1101,11 @@ absl::StatusOr<bool> InstructionFusion::RunImpl(
             }
 
             fusion_queue->PreFusion(operand, instruction);
+            TopologicalOrdinals::FusionSnapshot before =
+                ordinals.BeforeFusion(operand, instruction);
             fusion_instruction =
                 FuseIntoMultiOutput(operand, instruction, computation);
+            ordinals.AfterMultiOutputFusion(before, fusion_instruction);
           }
         }
 
