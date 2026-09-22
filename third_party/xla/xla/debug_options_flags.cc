@@ -512,6 +512,7 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
   opts.set_xla_gpu_executable_terminate_timeout_seconds(30);
   opts.set_xla_gpu_executable_warn_stuck_timeout_seconds(10);
   opts.set_xla_gpu_execution_terminate_timeout("inf");
+  opts.set_xla_gpu_device_execution_terminate_timeout("inf");
   opts.set_xla_gpu_execution_progress_tracking(0);
 
   opts.set_xla_gpu_first_collective_call_warn_stuck_timeout_seconds(20);
@@ -563,6 +564,8 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
       DebugOptions::DETECTION_MODE_NONE);
   opts.set_xla_gpu_experimental_scaled_dot_with_triton(true);
   opts.set_xla_early_exit_with_layouts(false);
+  opts.set_xla_gpu_experimental_early_exit(
+      DebugOptions::EARLY_EXIT_POINT_UNSET);
   opts.set_xla_gpu_experimental_all_fusions_with_triton(false);
   opts.set_xla_gpu_experimental_ragged_all_to_all_use_barrier_with_nccl(true);
   opts.set_xla_gpu_ragged_all_to_all_mode(
@@ -1054,6 +1057,17 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
           return false;
         }
         debug_options->set_xla_gpu_command_buffer_scheduling_mode(mode);
+        return true;
+      };
+
+  // Custom "sub-parser" lambda for `xla_gpu_experimental_early_exit`.
+  auto setter_for_xla_gpu_experimental_early_exit =
+      [debug_options](absl::string_view value) {
+        DebugOptions::EarlyExitPoint point;
+        if (!DebugOptions::EarlyExitPoint_Parse(value, &point)) {
+          return false;
+        }
+        debug_options->set_xla_gpu_experimental_early_exit(point);
         return true;
       };
 
@@ -3237,7 +3251,16 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       duration_setter_for(
           &DebugOptions::set_xla_gpu_execution_terminate_timeout),
       debug_options->xla_gpu_execution_terminate_timeout(),
-      "Set timeout for XLA:GPU execution to prevent undetected deadlocks"));
+      "Set timeout for host-side XLA:GPU execution "
+      "(inf to disable); does not wait for asynchronous device work"));
+
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_device_execution_terminate_timeout",
+      duration_setter_for(
+          &DebugOptions::set_xla_gpu_device_execution_terminate_timeout),
+      debug_options->xla_gpu_device_execution_terminate_timeout(),
+      "Set timeout to abort if enqueued XLA:GPU device work does not complete "
+      "after host dispatch (inf to disable)"));
 
   flag_list->push_back(tsl::Flag(
       "xla_gpu_execution_progress_tracking",
@@ -3862,6 +3885,13 @@ void MakeDebugOptionsFlags(std::vector<tsl::Flag>* flag_list,
       debug_options->xla_early_exit_with_layouts(),
       "If true, exit early from the layout assignment pass after assigning "
       "layouts to entry computations."));
+  flag_list->push_back(tsl::Flag(
+      "xla_gpu_experimental_early_exit",
+      setter_for_xla_gpu_experimental_early_exit,
+      DebugOptions::EarlyExitPoint_Name(
+          debug_options->xla_gpu_experimental_early_exit()),
+      "Exits compilation early at the specified point. Available options: "
+      "EARLY_EXIT_POINT_UNSET, EARLY_EXIT_POINT_AFTER_CONFIG_ASSIGNMENT."));
   flag_list->push_back(tsl::Flag(
       "xla_gpu_print_compilation_stats",
       bool_setter_for(&DebugOptions::set_xla_gpu_print_compilation_stats),

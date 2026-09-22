@@ -113,7 +113,6 @@ cc_library(
     compatible_with = get_compatible_with_portable(),
     deps = [
         ":backend_configs_cc",
-        ":ir_emission_utils",
         "//xla:shape_util",
         "//xla:util",
         "//xla:xla_proto_cc",
@@ -129,9 +128,6 @@ cc_library(
         "@com_google_absl//absl/base:no_destructor",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/container:inlined_vector",
-        "@com_google_absl//absl/functional:function_ref",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/log:die_if_null",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_macros",
         "@com_google_absl//absl/status:statusor",
@@ -507,6 +503,7 @@ cc_library(
         "//xla/backends/gpu/codegen/llvm:llvm_emitter",
         "//xla/backends/gpu/codegen/triton:triton_kernel_source",
         "//xla/backends/gpu/codegen/triton:xtile_compiler",
+        "//xla/backends/gpu/ffi:ffi_attributes_from_backend_config",
         "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_emitter_context",
         "//xla/backends/gpu/libraries/native_custom_call_thunks:native_custom_call_handler_registry",
         "//xla/backends/gpu/runtime:all_gather_thunk",
@@ -780,28 +777,6 @@ xla_cc_test(
 )
 
 cc_library(
-    name = "execution_watchdog",
-    srcs = ["execution_watchdog.cc"],
-    hdrs = ["execution_watchdog.h"],
-    deps = [
-        ":gpu_executable_run_options",
-        "//xla:status_macros",
-        "//xla:xla_proto_cc",
-        "//xla/runtime:hang_watchdog",
-        "//xla/stream_executor:stream",
-        "@com_google_absl//absl/base:core_headers",
-        "@com_google_absl//absl/base:nullability",
-        "@com_google_absl//absl/log",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/strings:string_view",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-    ],
-)
-
-cc_library(
     name = "gpu_executable",
     srcs = [
         "gpu_executable.cc",
@@ -816,7 +791,6 @@ cc_library(
         ":backend_configs_cc",
         ":buffer_allocations",
         ":dense_data_intermediate",
-        ":execution_watchdog",
         ":gpu_executable_buffer_allocator",
         ":gpu_executable_proto_cc",
         ":gpu_executable_run_options",
@@ -854,6 +828,7 @@ cc_library(
         "//xla/hlo/ir:hlo",
         "//xla/pjrt/proto:compile_options_proto_cc",
         "//xla/runtime:device_id",
+        "//xla/runtime:hang_watchdog",
         "//xla/service:buffer_assignment",
         "//xla/service:collective_ops_utils",
         "//xla/service:computation_layout",
@@ -931,26 +906,10 @@ tf_proto_library(
     ],
 )
 
-xla_cc_test(
-    name = "execution_watchdog_test",
-    srcs = ["execution_watchdog_test.cc"],
-    deps = [
-        ":execution_watchdog",
-        ":gpu_executable_run_options",
-        "//xla:xla_proto_cc",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:status_macros",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/synchronization",
-        "@com_google_absl//absl/time",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-xla_cc_test(
+xla_test(
     name = "gpu_executable_test",
     srcs = ["gpu_executable_test.cc"],
+    backends = ["gpu"],
     deps = [
         ":buffer_allocations",
         ":gpu_executable",
@@ -974,13 +933,13 @@ xla_cc_test(
         "//xla/backends/gpu/runtime:thunk",
         "//xla/backends/gpu/runtime:thunk_executor",
         "//xla/backends/gpu/runtime:thunk_proto_cc",
+        "//xla/backends/gpu/tests:hlo_pjrt_gpu_test_base",
         "//xla/client:executable_build_options",
         "//xla/codegen/emitters:kernel_arguments",
         "//xla/hlo/analysis:alias_info",
         "//xla/hlo/analysis:hlo_ordering",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/parser:hlo_parser",
-        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
         "//xla/pjrt/proto:compile_options_proto_cc",
         "//xla/service:buffer_assignment",
         "//xla/service:buffer_value",
@@ -1978,6 +1937,7 @@ cc_library(
         "//xla/hlo/transforms/simplifiers:broadcast_canonicalizer",
         "//xla/hlo/transforms/simplifiers:conditional_canonicalizer",
         "//xla/hlo/transforms/simplifiers:convert_mover",
+        "//xla/hlo/transforms/simplifiers:degenerate_dimension_rewriter",
         "//xla/hlo/transforms/simplifiers:dot_merger",
         "//xla/hlo/transforms/simplifiers:dynamic_dimension_simplifier",
         "//xla/hlo/transforms/simplifiers:flatten_call_graph",
