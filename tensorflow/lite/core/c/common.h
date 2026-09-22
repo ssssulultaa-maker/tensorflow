@@ -392,9 +392,16 @@ typedef struct TfLiteBlockwiseQuantization {
   int32_t scale;
   // Index of the tensor containing the zero points.
   int32_t zero_point;
-  // Quantization blocksize.
+  // Quantization blocksize. Only expresses blocking along the last dimension.
+  // Ignored when `block_shape` is non-null.
   int32_t blocksize;
   int32_t quantized_dimension;
+  // Optional N-D block shape, with one entry per dimension of the quantized
+  // tensor. `block_shape->data[d]` is the extent of a single block along
+  // dimension `d`, so the scale and zero point tensors have shape
+  // `ceil(tensor_shape / block_shape)`. Null on models written before this
+  // field existed, in which case `blocksize` applies. Owned by this struct.
+  TfLiteIntArray* block_shape;
 } TfLiteBlockwiseQuantization;
 
 /// Parameters for multi-axis quantization. The scales and zero_points fields
