@@ -263,6 +263,7 @@ TfLiteQuantization TfLiteQuantizationClone(const TfLiteQuantization& src) {
       dst_params->scale = src_params->scale;
       dst_params->zero_point = src_params->zero_point;
       dst_params->quantized_dimension = src_params->quantized_dimension;
+      dst_params->block_shape = TfLiteIntArrayCopy(src_params->block_shape);
       break;
     }
     case kTfLiteMultiAxisQuantization: {
@@ -384,7 +385,13 @@ void TfLiteQuantizationFree(TfLiteQuantization* quantization) {
   if (quantization->type == kTfLiteBlockwiseQuantization) {
     TfLiteBlockwiseQuantization* q_params =
         reinterpret_cast<TfLiteBlockwiseQuantization*>(quantization->params);
-    free(q_params);
+    if (q_params) {
+      if (q_params->block_shape) {
+        TfLiteIntArrayFree(q_params->block_shape);
+        q_params->block_shape = nullptr;
+      }
+      free(q_params);
+    }
   }
   if (quantization->type == kTfLiteMultiAxisQuantization) {
     TfLiteMultiAxisQuantization* q_params =
