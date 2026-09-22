@@ -383,6 +383,7 @@ class SpecializeTopkVisitor : public DfsHloRewriteVisitor {
     // Route stable TopK to RAFT select_k via Uint64 adapter
     if (is_cuda && enable_raft_for_stable_topk &&
         ShouldRewriteStableTopKToUint64(topk)) {
+      VLOG(2) << "Rewriting stable TopK to RAFT select_k via Uint64 adapter";
       ABSL_ASSIGN_OR_RETURN(HloInstruction * new_topk,
                        RewriteStableTopKToUint64(topk));
       return ReplaceInstruction(topk, new_topk);
