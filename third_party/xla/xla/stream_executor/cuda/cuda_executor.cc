@@ -387,6 +387,17 @@ absl::StatusOr<int64_t> GetMaxSharedMemoryPerBlockOptin(CUdevice device) {
       device, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN);
 }
 
+int64_t GetMaxOversizedSharedMemoryPerBlock(CUdevice device) {
+#if CUDA_VERSION >= 13040
+  return GetSimpleAttribute<int64_t>(
+             device, CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK)
+      .value_or(0);
+#else
+  (void)device;
+  return 0;
+#endif
+}
+
 absl::StatusOr<int64_t> GetReservedSharedMemoryPerBlock(CUdevice device) {
   return GetSimpleAttribute<int64_t>(
       device, CU_DEVICE_ATTRIBUTE_RESERVED_SHARED_MEMORY_PER_BLOCK);
@@ -1117,6 +1128,9 @@ absl::StatusOr<std::unique_ptr<Kernel>> CudaExecutor::LoadKernel(
                         device_ordinal())));
     cuda_kernel->set_gpu_function(func);
 
+  } else if (spec.has_function_ptr()) {
+    cuda_kernel->set_gpu_function(
+        static_cast<CUfunction>(spec.function_ptr()->function));
   } else {
     return absl::InternalError("No method of loading CUDA kernel provided");
   }
@@ -1136,9 +1150,11 @@ absl::StatusOr<std::unique_ptr<Kernel>> CudaExecutor::LoadKernel(
   // to be a way to reflect on the number of expected arguments w/the CUDA API.
   cuda_kernel->set_arity(spec.arity());
 
-  ABSL_ASSIGN_OR_RETURN(KernelMetadata kernel_metadata,
-                   cuda_kernel->GetKernelMetadata());
-  cuda_kernel->set_metadata(kernel_metadata);
+  if (!spec.has_function_ptr()) {
+    ABSL_ASSIGN_OR_RETURN(KernelMetadata kernel_metadata,
+                     cuda_kernel->GetKernelMetadata());
+    cuda_kernel->set_metadata(kernel_metadata);
+  }
   if (std::holds_alternative<KernelLoaderSpec::KernelArgsPackingFunc>(
           spec.kernel_args_packing())) {
     cuda_kernel->set_args_packing(
@@ -1842,6 +1858,8 @@ CudaExecutor::CreateDeviceDescription(int device_ordinal) {
   desc.set_shared_memory_per_block(GetMaxSharedMemoryPerBlock(device).value());
   desc.set_shared_memory_per_block_optin(
       GetMaxSharedMemoryPerBlockOptin(device).value());
+  desc.set_oversized_shared_memory_per_block(
+      GetMaxOversizedSharedMemoryPerBlock(device));
   desc.set_reserved_shared_memory_per_block(
       GetReservedSharedMemoryPerBlock(device).value());
   desc.set_max_blocks_per_multiprocessor(

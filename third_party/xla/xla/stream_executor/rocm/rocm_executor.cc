@@ -696,6 +696,9 @@ absl::StatusOr<std::unique_ptr<Kernel>> RocmExecutor::LoadKernel(
                  "Failed call to hipGetFuncBySymbol"));
     rocm_kernel->set_gpu_function(func);
 
+  } else if (spec.has_function_ptr()) {
+    rocm_kernel->set_gpu_function(
+        static_cast<hipFunction_t>(spec.function_ptr()->function));
   } else {
     return absl::InternalError("No method of loading ROCM kernel provided");
   }
@@ -708,7 +711,7 @@ absl::StatusOr<std::unique_ptr<Kernel>> RocmExecutor::LoadKernel(
   rocm_kernel->set_arity(spec.arity());
 
   // unable to get kernel metadata for in-process kernel
-  if (!spec.has_in_process_symbol()) {
+  if (!spec.has_in_process_symbol() && !spec.has_function_ptr()) {
     ABSL_ASSIGN_OR_RETURN(KernelMetadata kernel_metadata,
                      rocm_kernel->GetKernelMetadata());
     rocm_kernel->set_metadata(kernel_metadata);

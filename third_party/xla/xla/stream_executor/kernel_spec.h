@@ -67,6 +67,12 @@ struct InProcessSymbol {
   std::string persistent_name;
 };
 
+// Loads kernel from an already-resolved device function handle (e.g.
+// CUfunction or hipFunction_t).
+struct FunctionPtr {
+  void* function;
+};
+
 // Kernel loader specification for PTX text that resides in memory.
 struct CudaPtxInMemory {
   absl::string_view ptx;
@@ -130,6 +136,9 @@ class KernelLoaderSpec {
   bool has_in_process_symbol() const {
     return std::holds_alternative<InProcessSymbol>(payload_);
   }
+  bool has_function_ptr() const {
+    return std::holds_alternative<FunctionPtr>(payload_);
+  }
   bool has_cuda_cubin_in_memory() const {
     return std::holds_alternative<CudaCubinInMemory>(payload_) ||
            std::holds_alternative<OwningCudaCubinInMemory>(payload_) ||
@@ -147,6 +156,13 @@ class KernelLoaderSpec {
       return std::nullopt;
     }
     return std::get<InProcessSymbol>(payload_);
+  }
+
+  std::optional<FunctionPtr> function_ptr() const {
+    if (!has_function_ptr()) {
+      return std::nullopt;
+    }
+    return std::get<FunctionPtr>(payload_);
   }
 
   std::optional<CudaCubinInMemory> cuda_cubin_in_memory() const {
@@ -185,6 +201,9 @@ class KernelLoaderSpec {
   static KernelLoaderSpec CreateInProcessSymbolSpec(
       void* symbol, std::string kernel_name, size_t arity,
       KernelArgsPacking kernel_args_packing = nullptr);
+  static KernelLoaderSpec CreateFunctionPtrSpec(
+      void* function, std::string kernel_name, size_t arity,
+      KernelArgsPacking kernel_args_packing = KernelArgsPackingFunc{});
   static KernelLoaderSpec CreateSerializableInProcessSymbolSpec(
       std::string persistent_kernel_name, void* symbol, std::string kernel_name,
       size_t arity, KernelArgsPacking kernel_args_packing = nullptr);
@@ -234,10 +253,10 @@ class KernelLoaderSpec {
       std::optional<SymbolResolver> symbol_resolver = std::nullopt);
 
  private:
-  using Payload =
-      std::variant<InProcessSymbol, CudaCubinInMemory, CudaPtxInMemory,
-                   OwningCudaCubinInMemory, OwningCudaPtxInMemory,
-                   SharedCudaCubinInMemory, SharedCudaPtxInMemory>;
+  using Payload = std::variant<InProcessSymbol, FunctionPtr, CudaCubinInMemory,
+                               CudaPtxInMemory, OwningCudaCubinInMemory,
+                               OwningCudaPtxInMemory, SharedCudaCubinInMemory,
+                               SharedCudaPtxInMemory>;
 
   explicit KernelLoaderSpec(
       Payload payload, std::string kernel_name, size_t arity,

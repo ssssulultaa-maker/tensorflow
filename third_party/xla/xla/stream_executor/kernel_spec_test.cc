@@ -66,6 +66,21 @@ TEST(KernelLoaderSpec, InProcessSymbol) {
   EXPECT_THAT(spec.kernel_name(), "kernel24");
 }
 
+TEST(KernelLoaderSpec, FunctionPtr) {
+  void* func = InventPointerToCudaKernel(0xDEADBEEF);
+  auto spec =
+      KernelLoaderSpec::CreateFunctionPtrSpec(func, "kernel24", /*arity=*/2);
+  EXPECT_FALSE(spec.has_cuda_cubin_in_memory());
+  EXPECT_FALSE(spec.has_cuda_ptx_in_memory());
+  EXPECT_FALSE(spec.has_in_process_symbol());
+  EXPECT_TRUE(spec.has_function_ptr());
+
+  EXPECT_THAT(spec.function_ptr(),
+              Optional(Field(&FunctionPtr::function, func)));
+  EXPECT_THAT(spec.kernel_name(), "kernel24");
+  EXPECT_THAT(spec.ToProto(), StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
 TEST(KernelLoaderSpec, CudaCubin) {
   static constexpr std::array<uint8_t, 4> kCubinData = {0xDE, 0xAD, 0xBE, 0xEF};
   auto spec = KernelLoaderSpec::CreateCudaCubinInMemorySpec(
@@ -309,10 +324,7 @@ TEST(kernelLoaderSpec, StoresKernelArgsPackingSpec) {
       ParseTextProtoOrDie<KernelArgsPackingSpecProto>(
           R"pb(
             kernel_arguments {
-              relocations {
-                kind: KIND_BITS64_ABSOLUTE
-                argument_index: 0
-              }
+              relocations { kind: KIND_BITS64_ABSOLUTE argument_index: 0 }
             }
             kernel_arguments { data: "\x34\x12\x00\x00" }
           )pb");
@@ -331,10 +343,7 @@ TEST(kernelLoaderSpec, StoresKernelArgsPackingSpec) {
                 arity: 42
                 kernel_args_packing_spec {
                   kernel_arguments {
-                    relocations {
-                      kind: KIND_BITS64_ABSOLUTE
-                      argument_index: 0
-                    }
+                    relocations { kind: KIND_BITS64_ABSOLUTE argument_index: 0 }
                   }
                   kernel_arguments { data: "\x34\x12\x00\x00" }
                 }

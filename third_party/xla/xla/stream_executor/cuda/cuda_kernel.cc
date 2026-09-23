@@ -89,6 +89,11 @@ absl::StatusOr<KernelMetadata> CudaKernel::GetKernelMetadata() {
 
 absl::Status CudaKernel::UpdateMaxDynamicSharedMemoryBytes(
     int32_t shared_memory_bytes) const {
+  // Metadata is only unpopulated when loaded via FunctionPtr, where the caller
+  // owns and already configured the CUfunction attributes.
+  if (!metadata().shared_memory_bytes().has_value()) {
+    return absl::OkStatus();
+  }
   if (shared_memory_bytes <=
       max_dynamic_shared_memory_bytes_.load(std::memory_order_relaxed)) {
     return absl::OkStatus();

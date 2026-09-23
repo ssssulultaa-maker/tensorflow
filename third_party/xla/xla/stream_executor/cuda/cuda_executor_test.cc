@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -27,6 +28,7 @@ limitations under the License.
 #include "absl/status/status_matchers.h"  // IWYU pragma: keep
 #include "absl/strings/match.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/cuda/cuda_kernel.h"
 #include "xla/stream_executor/cuda/cuda_platform.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_address.h"
@@ -127,6 +129,26 @@ TEST(CudaExecutorTest, GetCudaKernel) {
                        GetAddI32TestKernelSpec(cuda::kCudaPlatformId));
   verify_kernel(add);
   verify_kernel(GetAddI32PtxKernelSpec());
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<Kernel> base_kernel,
+                       executor->LoadKernel(add));
+  ASSERT_OK_AND_ASSIGN(const CudaKernel* cuda_kernel,
+                       cuda_executor->GetCudaKernel(base_kernel.get()));
+  KernelLoaderSpec func_ptr_spec = KernelLoaderSpec::CreateFunctionPtrSpec(
+      cuda_kernel->gpu_function(), "AddI32", /*arity=*/3);
+  verify_kernel(func_ptr_spec);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<Kernel> func_ptr_kernel,
+                       executor->LoadKernel(func_ptr_spec));
+  ASSERT_OK_AND_ASSIGN(const CudaKernel* func_ptr_cuda_kernel,
+                       cuda_executor->GetCudaKernel(func_ptr_kernel.get()));
+  // Passing INT32_MAX exceeds hardware SM shared-memory limits and would fail
+  // with CUDA_ERROR_INVALID_VALUE if cuFuncSetAttribute were called. This
+  // verifies that FunctionPtr kernels treat CUfunction attributes as
+  // caller-managed and short-circuit UpdateMaxDynamicSharedMemoryBytes.
+  EXPECT_OK(func_ptr_cuda_kernel->UpdateMaxDynamicSharedMemoryBytes(
+      std::numeric_limits<int32_t>::max()));
+  EXPECT_THAT(cuda_executor->GetCudaKernel(base_kernel.get()),
+              absl_testing::IsOkAndHolds(base_kernel.get()));
 }
 
 TEST(CudaExecutorTest, CreateUnifiedMemoryAllocatorWorks) {

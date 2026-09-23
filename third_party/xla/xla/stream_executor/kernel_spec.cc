@@ -42,6 +42,13 @@ KernelLoaderSpec KernelLoaderSpec::CreateInProcessSymbolSpec(
                           arity, kernel_args_packing};
 }
 
+KernelLoaderSpec KernelLoaderSpec::CreateFunctionPtrSpec(
+    void* function, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return KernelLoaderSpec{FunctionPtr{function}, std::move(kernel_name), arity,
+                          kernel_args_packing};
+}
+
 KernelLoaderSpec KernelLoaderSpec::CreateSerializableInProcessSymbolSpec(
     std::string persistent_kernel_name, void* symbol, std::string kernel_name,
     size_t arity, KernelArgsPacking kernel_args_packing) {
@@ -96,6 +103,10 @@ KernelLoaderSpec KernelLoaderSpec::CreateSharedCudaPtxInMemorySpec(
 }
 
 absl::StatusOr<KernelLoaderSpecProto> KernelLoaderSpec::ToProto() const {
+  if (has_function_ptr()) {
+    return absl::InvalidArgumentError(
+        "Serializing FunctionPtr KernelLoaderSpec to proto is not supported.");
+  }
   if (std::holds_alternative<KernelArgsPackingFunc>(kernel_args_packing_) &&
       std::get<KernelArgsPackingFunc>(kernel_args_packing_) != nullptr) {
     return absl::UnimplementedError(

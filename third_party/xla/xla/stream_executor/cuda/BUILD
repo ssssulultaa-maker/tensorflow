@@ -1673,6 +1673,7 @@ xla_test(
     deps = [
         ":cuda_compute_capability",
         ":cuda_executor",
+        ":cuda_kernel",
         ":cuda_platform",
         ":cuda_platform_id",
         "//xla/stream_executor:device_address",

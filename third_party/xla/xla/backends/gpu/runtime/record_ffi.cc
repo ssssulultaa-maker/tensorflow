@@ -268,22 +268,39 @@ class FfiKernelCache : public se::CommandBuffer::Resource {
           << ", ptr: " << it->second.get();
       return it->second.get();
     }
-    bool is_ptx = (format == XLA_FFI_SourceFormat_PTX);
     std::string kernel_name(kernel_name_view);
-    se::KernelLoaderSpec spec =
-        is_ptx
-            ? se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
-                  AsStringView(kernel_data, kernel_size), kernel_name, num_args)
-            : se::KernelLoaderSpec::CreateCudaCubinInMemorySpec(
-                  AsByteSpan(kernel_data, kernel_size), kernel_name, num_args);
-
+    std::optional<se::KernelLoaderSpec> spec;
+    switch (format) {
+      case XLA_FFI_SourceFormat_FUNCTION_PTR: {
+        spec = se::KernelLoaderSpec::CreateFunctionPtrSpec(
+            // FFI C API passes CUfunction via const void*; CUDA driver requires
+            // mutable pointer.
+            // NOLINTNEXTLINE.
+            const_cast<void*>(kernel_data), kernel_name, num_args);
+        break;
+      }
+      case XLA_FFI_SourceFormat_PTX: {
+        spec = se::KernelLoaderSpec::CreateCudaPtxInMemorySpec(
+            AsStringView(kernel_data, kernel_size), kernel_name, num_args);
+        break;
+      }
+      case XLA_FFI_SourceFormat_CUBIN: {
+        spec = se::KernelLoaderSpec::CreateCudaCubinInMemorySpec(
+            AsByteSpan(kernel_data, kernel_size), kernel_name, num_args);
+        break;
+      }
+      default: {
+        return absl::InvalidArgumentError(
+            absl::StrFormat("Unsupported XLA_FFI_SourceFormat: %d", format));
+      }
+    }
     ABSL_ASSIGN_OR_RETURN(std::unique_ptr<se::Kernel> kernel,
-                     executor->LoadKernel(spec));
-
+                     executor->LoadKernel(*spec));
     se::Kernel* kernel_ptr = kernel.get();
-    kernels_[KernelKey{kernel_name, kernel_data}] = std::move(kernel);
+    kernels_.try_emplace(KernelKey{std::move(kernel_name), kernel_data},
+                         std::move(kernel));
     XLA_VLOG_DEVICE(3, device_ordinal)
-        << "FfiKernelCache: created kernel: " << kernel_name
+        << "FfiKernelCache: created kernel: " << kernel_name_view
         << ", ptr: " << kernel_ptr;
     return kernel_ptr;
   }
